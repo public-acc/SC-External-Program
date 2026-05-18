@@ -1,0 +1,434 @@
+import scnd;
+
+/*
+SCND single-file maker example.
+
+Required euddraft/eud editor settings:
+
+[scnd]
+[MSQC]
+[eudTurbo]
+[TriggerEditor\main.eps]
+
+Do not add SCNDInputMSQCIsTransfer / SCNDInputMSQCSend lines manually.
+SCNDgram launcher key edges are converted through msqcloader before the in-map
+input buffer changes.
+SCND auto-detects the [MSQC] msqcloader module, so makers do not need any
+manual bridge setup in this file.
+
+[chatEvent]
+__ADDR__ : 0x58D900
+__PTRADDR__ : 0x58F500
+__LENADDR__ : 0x58F504
+__PATTERNADDR__ : 0x58F508
+!loadon : 7003
+!loadoff : 7004
+!save : 7005
+!maxsave : 7006
+!showload : 7007
+!showglobal : 7008
+
+How this example is meant to work:
+  - !save calls requestExampleSave(p).
+  - !maxsave calls startExampleMaxSave(p).
+  - !loadon calls setExampleLoadAllowed(p, 1).
+  - !loadoff calls setExampleLoadAllowed(p, 0).
+  - !showload displays the current loaded player-bound test values.
+  - !showglobal displays the current map-global test values.
+  - SCNDgram launcher sends F13-gated SCND packet keys, then commit.
+  - scnd.run_player(p) also receives SCNDgram launcher input and emits
+    SCNDInputMSQC events only on packet/commit/cancel edges.
+  - The in-map input buffer changes only after MSQC receive values are synced.
+  - [MSQC] / msqcloader is also used after decode, to synchronize the final
+    payload before bound values are applied.
+  - If SHEET_ID is non-empty and global bindings exist, SCNDgram sends
+    Global sheet code + player save code together; scnd waits for both packets,
+    then applies global first and player second.
+  - Launcher input is accepted only while load is open.
+  - scnd.py closes the load gate on save request, save completion, load start,
+    load completion, and load failure.
+  - Save/load keys are bound to the current StarCraft nickname.
+
+This example keeps the chatEvent commands wired for quick testing.  Production
+maps can also call the same functions below from buttons, switches, deaths,
+dialogs, or any other maker-owned state.
+*/
+
+const SAVE_KEY = "CHANGE_THIS_TO_A_LONG_PRIVATE_MAKER_KEY";
+const MAP_ID = "MY_MAP_ID";   // Cryptographic save identity. Do not change after release.
+const MAP_NAME = "MY_MAP";    // Launcher display/folder name only.
+
+// Only the spreadsheet ID goes here, not a full URL.
+// Non-empty SHEET_ID means the launcher may use global variables.
+const SHEET_ID = "";
+const APP_SCRIPT_ID = "";
+
+
+// compat_mode:
+//   0 = current exact layout. Best capacity, no bind compatibility changes.
+//   1 = player save stores bit widths. Existing bit increase and appended binds can load.
+//   2 = player save stores key + bit widths. Order changes/removal/appended binds can load, but capacity is lowest.
+// Global variables always use the current single global-load format.
+scnd.configure(MAP_ID, SAVE_KEY, 1);
+// If APP_SCRIPT_ID is non-empty, write_mpq_manifest also writes
+// SCND_SERVER_PROPERTY_TEMPLATE.gs for the private save Apps Script.
+// Keep that file private because it contains SAVE_KEY.
+
+// compat_mode 1 one-screen schema:
+//   40 * 8bit + 20 * 12bit + 84 * 4bit + mixed 1..8bit = 152 fields
+//   compat payload: 916 bytes -> 229 dwords
+//   visible Hangul: 571 chars, fits 52 chars x 11 code rows
+//   global test values are load-only and are not included in player saves.
+//
+// Binding examples:
+//   bind_player_value(KEY, EUDArray(8), bits)
+//       -> one value per player, stored as values[p].
+//   bind_player_array_bytes(..., 1)     -> every item uses 1 byte.
+//       -> N values per player, stored as values[p * N + i].
+//   bind_player_array(..., 12)          -> every item uses 12 bits.
+//   bind_player_array_bits(..., 6, 17, 4, ...)
+//       -> item 0 uses 6 bits, item 1 uses 17 bits, item 2 uses 4 bits, ...
+//   mixed_b1..mixed_b8                 -> split bindings with different widths.
+// EPScript const arrays become EUDArray, so do not pass an EPS array as `bits`.
+// Use bind_player_array_bits from EPS when item widths differ.
+// Python maker scripts can still pass a normal Python list to bind_player_array.
+const U8_COUNT = 40;
+const U12_COUNT = 20;
+const U4_COUNT = 84;
+const MIXED_COUNT = 8;
+const GLOBAL_COUNT = 8;
+
+const SINGLE_U8 = EUDArray(8 * U8_COUNT);
+const SINGLE_U12 = EUDArray(8 * U12_COUNT);
+const SINGLE_U4 = EUDArray(8 * U4_COUNT);
+const MIXED_BITS = EUDArray(8 * MIXED_COUNT);
+const GLOBAL_TEST = EUDArray(GLOBAL_COUNT);
+
+const MAXSAVE_BATCH = 64;
+const MAXSAVE_TOTAL = U8_COUNT + U12_COUNT + U4_COUNT + MIXED_COUNT;
+const MAXSAVE_RUN = EUDArray(8);
+const MaxSaveActive = EUDArray(8);
+const MaxSaveIndex = EUDArray(8);
+const MaxSaveSeed = EUDArray(8);
+
+const LOAD_REPORT_TICKS = 720;
+const LoadReportTimer = EUDArray(8);
+const LoadReportWaiting = EUDArray(8);
+const LoadReportShown = EUDArray(8);
+const LoadReportView = StringBuffer(4096);
+const GlobalReportTimer = EUDArray(8);
+const GlobalReportView = StringBuffer(2048);
+
+function onPluginStart() {
+    scnd.clear_bindings();
+    scnd.bind_player_array_bytes("single_u8", SINGLE_U8, U8_COUNT, 1);
+    scnd.bind_player_array("single_u12", SINGLE_U12, U12_COUNT, 12);
+    scnd.bind_player_array("single_u4", SINGLE_U4, U4_COUNT, 4);
+    scnd.bind_player_array_bits("mixed_bits_array", MIXED_BITS, MIXED_COUNT, 1, 2, 3, 4, 5, 6, 7, 8);
+    scnd.bind_global_array_bits(GLOBAL_TEST, 6, 17, 4, 1, 1, 10, 3, 2);
+    scnd.write_mpq_manifest(MAP_ID, MAP_NAME, SHEET_ID, APP_SCRIPT_ID);
+}
+
+function scndNextRandom(seed) {
+    return seed * 1664525 + 1013904223;
+}
+
+function openLoadGate(p) {
+    LoadReportTimer[p] = 0;
+    LoadReportWaiting[p] = 1;
+    LoadReportShown[p] = 0;
+    scnd.enable_load(p);
+}
+
+function closeLoadGate(p) {
+    LoadReportWaiting[p] = 0;
+    scnd.disable_load(p);
+}
+
+function setExampleLoadAllowed(p, enabled) {
+    if (enabled == 1) {
+        openLoadGate(p);
+    }
+    else {
+        closeLoadGate(p);
+    }
+}
+
+function requestExampleSave(p) {
+    closeLoadGate(p);
+    if (MaxSaveActive[p] == 0) {
+        scnd.save(p);
+    }
+}
+
+function startExampleMaxSave(p) {
+    closeLoadGate(p);
+
+    if (MaxSaveActive[p] == 1) {
+        f_eprintln("\x04SCND maxsave preparing...", MaxSaveIndex[p], "/", MAXSAVE_TOTAL);
+        return;
+    }
+    if (scnd.busy(p) == 1) {
+        f_eprintln("\x08SCND busy");
+        return;
+    }
+
+    MAXSAVE_RUN[p] = MAXSAVE_RUN[p] + 1;
+    MaxSaveActive[p] = 1;
+    MaxSaveIndex[p] = 0;
+    MaxSaveSeed[p] = 0x13579BDF + MAXSAVE_RUN[p] * 131 + (p + 1) * 17;
+    f_eprintln("\x07SCND maxsave preparing...");
+}
+
+function fillOneExampleMaxSaveValue(p, index) {
+    var seed = MaxSaveSeed[p];
+    seed = scndNextRandom(seed + index + 1);
+    MaxSaveSeed[p] = seed;
+
+    if (index < U8_COUNT) {
+        SINGLE_U8[p * U8_COUNT + index] = (seed % 255) + 1;
+        return;
+    }
+
+    if (index < U8_COUNT + U12_COUNT) {
+        var j = index - U8_COUNT;
+        SINGLE_U12[p * U12_COUNT + j] = (seed % 4095) + 1;
+        return;
+    }
+
+    if (index < U8_COUNT + U12_COUNT + U4_COUNT) {
+        var k = index - U8_COUNT - U12_COUNT;
+        SINGLE_U4[p * U4_COUNT + k] = (seed % 15) + 1;
+        return;
+    }
+
+    var m = index - U8_COUNT - U12_COUNT - U4_COUNT;
+    if (m == 0) {
+        MIXED_BITS[p * MIXED_COUNT + 0] = seed % 2;
+        return;
+    }
+    if (m == 1) {
+        MIXED_BITS[p * MIXED_COUNT + 1] = seed % 4;
+        return;
+    }
+    if (m == 2) {
+        MIXED_BITS[p * MIXED_COUNT + 2] = seed % 8;
+        return;
+    }
+    if (m == 3) {
+        MIXED_BITS[p * MIXED_COUNT + 3] = seed % 16;
+        return;
+    }
+    if (m == 4) {
+        MIXED_BITS[p * MIXED_COUNT + 4] = seed % 32;
+        return;
+    }
+    if (m == 5) {
+        MIXED_BITS[p * MIXED_COUNT + 5] = seed % 64;
+        return;
+    }
+    if (m == 6) {
+        MIXED_BITS[p * MIXED_COUNT + 6] = seed % 128;
+        return;
+    }
+    MIXED_BITS[p * MIXED_COUNT + 7] = seed % 256;
+}
+
+function updateExampleMaxSave(p) {
+    if (MaxSaveActive[p] != 1) {
+        return;
+    }
+
+    for (var n = 0; n < MAXSAVE_BATCH; n++) {
+        if (MaxSaveIndex[p] < MAXSAVE_TOTAL) {
+            fillOneExampleMaxSaveValue(p, MaxSaveIndex[p]);
+            MaxSaveIndex[p] = MaxSaveIndex[p] + 1;
+        }
+    }
+
+    if (MaxSaveIndex[p] >= MAXSAVE_TOTAL) {
+        MaxSaveActive[p] = 0;
+        f_eprintln("\x07SCND maxsave ready. save start.");
+        scnd.save(p);
+    }
+    else {
+        f_eprintln("\x04SCND maxsave preparing...", MaxSaveIndex[p], "/", MAXSAVE_TOTAL);
+    }
+}
+
+function buildGlobalReport(p) {
+    GlobalReportView.insert(0);
+    GlobalReportView.appendf("\x07SCND GLOBAL\x04 requested by player={}\n", p);
+    GlobalReportView.appendf(
+        "\x04global[0..7] = {} {} {} {} {} {} {} {}\n",
+        GLOBAL_TEST[0],
+        GLOBAL_TEST[1],
+        GLOBAL_TEST[2],
+        GLOBAL_TEST[3],
+        GLOBAL_TEST[4],
+        GLOBAL_TEST[5],
+        GLOBAL_TEST[6],
+        GLOBAL_TEST[7]
+    );
+}
+
+function showExampleGlobal(p) {
+    buildGlobalReport(p);
+    GlobalReportTimer[p] = LOAD_REPORT_TICKS;
+}
+
+function buildLoadReport(p) {
+    var u8Base = p * U8_COUNT;
+    var u12Base = p * U12_COUNT;
+    var u4Base = p * U4_COUNT;
+    var mixedBase = p * MIXED_COUNT;
+
+    LoadReportView.insert(0);
+    LoadReportView.appendf("\x07SCND LOAD OK\x04 player={}\n", p);
+    LoadReportView.appendf(
+        "\x04single_u8[0..7]  = {} {} {} {} {} {} {} {}\n",
+        SINGLE_U8[u8Base + 0],
+        SINGLE_U8[u8Base + 1],
+        SINGLE_U8[u8Base + 2],
+        SINGLE_U8[u8Base + 3],
+        SINGLE_U8[u8Base + 4],
+        SINGLE_U8[u8Base + 5],
+        SINGLE_U8[u8Base + 6],
+        SINGLE_U8[u8Base + 7]
+    );
+    LoadReportView.appendf(
+        "\x04single_u12[0..7] = {} {} {} {} {} {} {} {}\n",
+        SINGLE_U12[u12Base + 0],
+        SINGLE_U12[u12Base + 1],
+        SINGLE_U12[u12Base + 2],
+        SINGLE_U12[u12Base + 3],
+        SINGLE_U12[u12Base + 4],
+        SINGLE_U12[u12Base + 5],
+        SINGLE_U12[u12Base + 6],
+        SINGLE_U12[u12Base + 7]
+    );
+    LoadReportView.appendf(
+        "\x04single_u4[0..15] = {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}\n",
+        SINGLE_U4[u4Base + 0],
+        SINGLE_U4[u4Base + 1],
+        SINGLE_U4[u4Base + 2],
+        SINGLE_U4[u4Base + 3],
+        SINGLE_U4[u4Base + 4],
+        SINGLE_U4[u4Base + 5],
+        SINGLE_U4[u4Base + 6],
+        SINGLE_U4[u4Base + 7],
+        SINGLE_U4[u4Base + 8],
+        SINGLE_U4[u4Base + 9],
+        SINGLE_U4[u4Base + 10],
+        SINGLE_U4[u4Base + 11],
+        SINGLE_U4[u4Base + 12],
+        SINGLE_U4[u4Base + 13],
+        SINGLE_U4[u4Base + 14],
+        SINGLE_U4[u4Base + 15]
+    );
+    LoadReportView.appendf(
+        "\x04mixed_bits[0..7] = {} {} {} {} {} {} {} {}\n",
+        MIXED_BITS[mixedBase + 0],
+        MIXED_BITS[mixedBase + 1],
+        MIXED_BITS[mixedBase + 2],
+        MIXED_BITS[mixedBase + 3],
+        MIXED_BITS[mixedBase + 4],
+        MIXED_BITS[mixedBase + 5],
+        MIXED_BITS[mixedBase + 6],
+        MIXED_BITS[mixedBase + 7]
+    );
+}
+
+function showExampleLoad(p) {
+    buildLoadReport(p);
+    LoadReportTimer[p] = LOAD_REPORT_TICKS;
+}
+
+function displayLoadReport(p) {
+    if (GlobalReportTimer[p] > 0) {
+        GlobalReportView.DisplayAt(2);
+        GlobalReportTimer[p] = GlobalReportTimer[p] - 1;
+    }
+    else if (LoadReportTimer[p] > 0) {
+        LoadReportView.DisplayAt(2);
+        LoadReportTimer[p] = LoadReportTimer[p] - 1;
+    }
+}
+
+function updateLoadReport(p) {
+    if (scnd.busy(p) == 1) {
+        return;
+    }
+
+    if (scnd.done(p) == 1) {
+        if (LoadReportWaiting[p] == 1 && scnd.ok(p) == 1 && LoadReportShown[p] == 0) {
+            if (scnd.is_new_user(p) == 1) {
+                LoadReportView.insert(0);
+                LoadReportView.append("\x07SCND new player load done.\n");
+                LoadReportView.append("\x04Player save variables were not overwritten.\n");
+            }
+            else {
+                buildLoadReport(p);
+            }
+            LoadReportTimer[p] = LOAD_REPORT_TICKS;
+            LoadReportShown[p] = 1;
+        }
+        LoadReportWaiting[p] = 0;
+        scnd.reset_done(p);
+    }
+}
+
+function beforeTriggerExec() {
+    foreach (p : EUDLoopPlayer("Human")) {
+        setcurpl(p);
+        scnd.run_player(p);
+        updateExampleMaxSave(p);
+
+        /*
+        Wire your synchronized map UI/state here, for example:
+
+          if (makerSaveButton[p] == 1) {
+              requestExampleSave(p);
+          }
+
+          if (makerMaxSaveButton[p] == 1) {
+              startExampleMaxSave(p);
+          }
+
+          if (makerLoadAllowed[p] == 1) {
+              setExampleLoadAllowed(p, 1);
+          }
+
+        */
+
+        if (<?ChatEvent("CurrentPlayer", "!save")?>) {
+            requestExampleSave(p);
+        }
+
+        if (<?ChatEvent("CurrentPlayer", "!maxsave")?>) {
+            startExampleMaxSave(p);
+        }
+
+        if (<?ChatEvent("CurrentPlayer", "!loadon")?>) {
+            setExampleLoadAllowed(p, 1);
+        }
+
+        if (<?ChatEvent("CurrentPlayer", "!loadoff")?>) {
+            setExampleLoadAllowed(p, 0);
+        }
+
+        if (<?ChatEvent("CurrentPlayer", "!showload")?>) {
+            showExampleLoad(p);
+        }
+
+        if (<?ChatEvent("CurrentPlayer", "!showglobal")?>) {
+            showExampleGlobal(p);
+        }
+
+        updateLoadReport(p);
+
+        if (IsUserCP()) {
+            displayLoadReport(p);
+        }
+    }
+}
