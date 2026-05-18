@@ -200,7 +200,6 @@ function onPluginStart() {
     scnd.bind_player_array("single_u12", SINGLE_U12, U12_COUNT, 12);
     scnd.bind_player_array_bits("mixed", MIXED, 4, 6, 17, 4, 1);
     scnd.bind_global_array_bits(GLOBAL_TEST, 6, 17, 4, 1, 1, 10, 3, 2);
-    scnd.set_map_info(MAP_DISPLAY_NAME, MAP_IMAGE);
     scnd.write_mpq_manifest(MAP_ID, MAP_NAME, SHEET_ID, APP_SCRIPT_ID);
 }
 ```
